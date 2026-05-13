@@ -59,6 +59,11 @@ namespace Iciclecreek.Terminal
                 nameof(Options),
                 defaultValue: null);
 
+        public static readonly StyledProperty<string?> ShellIntegrationCommandProperty =
+            AvaloniaProperty.Register<TerminalControl, string?>(
+                nameof(ShellIntegrationCommand),
+                defaultValue: null);
+
         public event EventHandler<ProcessExitedEventArgs>? ProcessExited;
 
         /// <summary>
@@ -118,6 +123,18 @@ namespace Iciclecreek.Terminal
         {
             get => GetValue(OptionsProperty);
             set => SetValue(OptionsProperty, value);
+        }
+
+        /// <summary>
+        /// Gets or sets a shell command injected into the PTY on the first incoming data event.
+        /// Embed the token <c>__ICTERMINT__</c> in the command (e.g. as a comment); any output
+        /// line containing that token is automatically hidden so the injection is invisible.
+        /// Set to <c>null</c> (default) to disable shell integration injection.
+        /// </summary>
+        public string? ShellIntegrationCommand
+        {
+            get => GetValue(ShellIntegrationCommandProperty);
+            set => SetValue(ShellIntegrationCommandProperty, value);
         }
 
         private static bool _stylesLoaded = false;
@@ -295,6 +312,7 @@ namespace Iciclecreek.Terminal
             {
                 _scrollBar.Scroll += OnScrollBarScroll;
                 _terminalView.Options = Options ?? new XTerm.Options.TerminalOptions();
+                _terminalView.ShellIntegrationCommand = ShellIntegrationCommand;
                 _terminalView.PropertyChanged += OnTerminalViewPropertyChanged;
                 _terminalView.ProcessExited += OnTerminalViewProcessExited;
                 SetCurrentDirectory(_terminalView.CurrentDirectory);
@@ -328,6 +346,13 @@ namespace Iciclecreek.Terminal
         private void OnTerminalViewProcessExited(object? sender, ProcessExitedEventArgs e)
         {
             ProcessExited?.Invoke(this, e);
+        }
+
+        protected override void OnPropertyChanged(AvaloniaPropertyChangedEventArgs change)
+        {
+            base.OnPropertyChanged(change);
+            if (change.Property == ShellIntegrationCommandProperty && _terminalView != null)
+                _terminalView.ShellIntegrationCommand = change.NewValue as string;
         }
 
         private void SetCurrentDirectory(string? currentDirectory)

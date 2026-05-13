@@ -35,6 +35,30 @@ namespace Iciclecreek.Terminal
         private int _bufferSize = 1000;
         private bool _isAlternateBuffer;
 
+        // Shell-integration injection: when set, sent to PTY on first data receipt
+        // and the echoed line (identified by a sentinel token) is stripped from output.
+        private const string ShellIntegrationSentinel = "__ICTERMINT__";
+        private string? _shellIntegrationCommand;
+        private volatile bool _shellIntegrationSent;
+
+        /// <summary>
+        /// Gets or sets a shell command that is injected into the PTY on the first
+        /// incoming data event (i.e. when the remote shell has started). The command
+        /// should embed <c>__ICTERMINT__</c> as a comment token; any line in the PTY
+        /// output containing that token is automatically suppressed so the injection
+        /// is invisible to the user.
+        /// Leave <c>null</c> (default) to disable the feature.
+        /// </summary>
+        public string? ShellIntegrationCommand
+        {
+            get => _shellIntegrationCommand;
+            set
+            {
+                _shellIntegrationCommand = value;
+                _shellIntegrationSent = false;
+            }
+        }
+
         // Process management
         private IPtyConnection? _ptyConnection;
         private CancellationTokenSource? _processCts;
@@ -1926,6 +1950,28 @@ namespace Iciclecreek.Terminal
 
                     var output = Encoding.UTF8.GetString(buffer, 0, bytesRead);
 
+                    // Shell-integration injection: on the first chunk of PTY data the
+                    // remote shell has printed its initial prompt, so it is ready to
+                    // receive input. Send the integration command once, then strip any
+                    // output line that echoes the sentinel token.
+                    if (!_shellIntegrationSent && _shellIntegrationCommand is { Length: > 0 } cmd)
+                    {
+                        _shellIntegrationSent = true;
+                        try
+                        {
+                            var cmdBytes = Utf8NoBom.GetBytes(cmd + "\n");
+                            await _ptyConnection!.WriterStream.WriteAsync(cmdBytes, 0, cmdBytes.Length, cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+                        catch { /* best-effort */ }
+                    }
+
+                    if (output.Contains(ShellIntegrationSentinel, StringComparison.Ordinal))
+                        output = StripSentinelLines(output);
+
+                    if (output.Length == 0)
+                        continue;
+
                     // Snapshot before write so we can detect buffer growth (MaxScrollback
                     // increases when _terminal.Write adds lines; ScrollToBottom only moves
                     // ViewportY and does not affect buffer length).
@@ -1982,6 +2028,26 @@ namespace Iciclecreek.Terminal
 
                 this.RequestInvalidate();
             }
+        }
+
+        /// <summary>
+        /// Removes any lines from <paramref name="text"/> that contain the shell-integration
+        /// sentinel token, so the injected command is not visible in the terminal output.
+        /// </summary>
+        private static string StripSentinelLines(string text)
+        {
+            var parts = text.Split('\n');
+            var filtered = new System.Text.StringBuilder(text.Length);
+            bool first = true;
+            foreach (var part in parts)
+            {
+                if (part.Contains(ShellIntegrationSentinel, StringComparison.Ordinal))
+                    continue;
+                if (!first) filtered.Append('\n');
+                filtered.Append(part);
+                first = false;
+            }
+            return filtered.ToString();
         }
 
         private void OnPtyProcessExited(object? sender, PtyExitedEventArgs e)
