@@ -76,6 +76,20 @@ namespace Iciclecreek.Terminal
         // Selection start is deferred until pointer movement so that a plain click doesn't show a caret.
         private (int Col, int Row)? _pendingSelectionStart = null;
 
+        // Selection endpoints tracked in *absolute* buffer-line coords (an index into
+        // Buffer.Lines == ViewportY + screenRow at capture time). XT.Selection.SelectionManager
+        // stores only viewport-relative rows and resolves them through Buffer.YDisp, so without
+        // this the highlight stays pinned to fixed screen rows when the buffer scrolls under it.
+        // We re-project these into the manager's viewport coords on every ViewportY change
+        // (see ReprojectSelection). Null when there is no selection.
+        // NOTE: AbsLine is an index into the CircularList Buffer.Lines; it is stable while the
+        // scrollback ring is not yet full. Once the ring is full and lines are evicted during
+        // heavy output a held selection can drift by the eviction count - same pre-existing
+        // fragility as GetSelectionText, and out of scope here.
+        private (int Col, int AbsLine)? _selAnchorAbs;
+        private (int Col, int AbsLine)? _selFocusAbs;
+        private XT.Selection.SelectionMode _selMode = XT.Selection.SelectionMode.Normal;
+
         // IME (Input Method Editor) support
         private TerminalInputMethodClient? _inputMethodClient;
 
@@ -533,6 +547,8 @@ namespace Iciclecreek.Terminal
 
                 if (oldValue != _terminal.Buffer.ViewportY)
                 {
+                    // Keep the selection glued to the buffer content as the viewport scrolls.
+                    ReprojectSelection();
                     RaisePropertyChanged(ViewportYProperty, oldValue, _terminal.Buffer.ViewportY);
                     this.RequestInvalidate();
                 }
@@ -827,6 +843,42 @@ namespace Iciclecreek.Terminal
             _cursorBlinkTimer.Stop();
             _isSelecting = false;
             _pendingSelectionStart = null;
+            _selAnchorAbs = null;
+            _selFocusAbs = null;
+        }
+
+        /// <summary>
+        /// Clears the selection in the underlying manager and our absolute-coord tracking.
+        /// All in-fork selection clears route through here so a stale anchor can't be re-projected.
+        /// </summary>
+        private void ClearSelectionState()
+        {
+            var sel = _terminal.Selection;
+            sel.ClearSelection();
+            _selAnchorAbs = null;
+            _selFocusAbs = null;
+        }
+
+        /// <summary>
+        /// Re-issues the selection to the (viewport-relative) SelectionManager using the current
+        /// ViewportY, so the highlight and copied text track the buffer content across scrollback.
+        /// Call after any change to ViewportY/YDisp.
+        /// </summary>
+        private void ReprojectSelection()
+        {
+            if (_selAnchorAbs is not { } a || _selFocusAbs is not { } f)
+                return;
+            if (!_terminal.Selection.HasSelection)
+                return;
+
+            // SelectionManager resolves a stored y via Buffer.Lines[YDisp + y], and the renderer
+            // draws screen row r from Lines[ViewportY + r] (ViewportY == YDisp). Keeping the
+            // stored y == AbsLine - ViewportY makes both resolve back to the original line.
+            // Off-screen rows (y < 0 or y >= Rows) are harmless: IsCellSelected returns false
+            // so the highlight clips, while GetSelectionText still reads Lines[AbsLine].
+            int vy = _terminal.Buffer.ViewportY;
+            _terminal.Selection.StartSelection(a.Col, a.AbsLine - vy, _selMode);
+            _terminal.Selection.UpdateSelection(f.Col, f.AbsLine - vy);
         }
 
         /// <summary>
@@ -957,7 +1009,7 @@ namespace Iciclecreek.Terminal
                 {
                     e.Handled = true;
                     await CopyAsync();
-                    _terminal.Selection.ClearSelection();
+                    ClearSelectionState();
                     this.RequestInvalidate();
                 }
                 else
@@ -976,7 +1028,7 @@ namespace Iciclecreek.Terminal
                     {
                         e.Handled = true;
                         await CopyAsync();
-                        _terminal.Selection.ClearSelection();
+                        ClearSelectionState();
                         this.RequestInvalidate();
                         return;
                     }
@@ -990,7 +1042,7 @@ namespace Iciclecreek.Terminal
                     {
                         e.Handled = true;
                         await CopyAsync();
-                        _terminal.Selection.ClearSelection();
+                        ClearSelectionState();
                         this.RequestInvalidate();
                         return;
                     }
@@ -999,7 +1051,7 @@ namespace Iciclecreek.Terminal
                 // Clear selection for any other keystroke
                 if (_terminal.Selection.HasSelection)
                 {
-                    _terminal.Selection.ClearSelection();
+                    ClearSelectionState();
                     this.RequestInvalidate();
                 }
 
@@ -1153,7 +1205,7 @@ namespace Iciclecreek.Terminal
             // Clear selection when text is being input
             if (_terminal.Selection.HasSelection)
             {
-                _terminal.Selection.ClearSelection();
+                ClearSelectionState();
                 this.RequestInvalidate();
             }
 
@@ -1193,7 +1245,7 @@ namespace Iciclecreek.Terminal
                         if (_terminal.Selection.HasSelection)
                         {
                             await CopyAsync();
-                            _terminal.Selection.ClearSelection();
+                            ClearSelectionState();
                             this.RequestInvalidate();
                         }
                         else
@@ -1207,7 +1259,7 @@ namespace Iciclecreek.Terminal
                     // Left-click clears existing selection before starting new one
                     if (props.IsLeftButtonPressed && _terminal.Selection.HasSelection)
                     {
-                        _terminal.Selection.ClearSelection();
+                        ClearSelectionState();
                         this.RequestInvalidate();
                     }
 
@@ -1225,12 +1277,20 @@ namespace Iciclecreek.Terminal
                         // Defer single-click selection until the pointer actually moves;
                         // this avoids showing a single-cell caret on every click.
                         _pendingSelectionStart = (col, row);
+                        int anchorAbs = ViewportY + row;
+                        _selAnchorAbs = (col, anchorAbs);
+                        _selFocusAbs = (col, anchorAbs);
+                        _selMode = XT.Selection.SelectionMode.Normal;
                         _isSelecting = true;
                     }
                     else
                     {
                         // Word / line select, or ShowCaretOnClick=true — start immediately.
                         int viewportRow = row;
+                        int anchorAbs = ViewportY + viewportRow;
+                        _selAnchorAbs = (col, anchorAbs);
+                        _selFocusAbs = (col, anchorAbs);
+                        _selMode = mode;
                         _terminal.Selection.StartSelection(col, viewportRow, mode);
                         _isSelecting = true;
                         _pendingSelectionStart = null;
@@ -1320,12 +1380,17 @@ namespace Iciclecreek.Terminal
                 if (_isSelecting)
                 {
                     int viewportRow = row;
+                    int vy = ViewportY;
                     if (_pendingSelectionStart.HasValue)
                     {
                         // First movement after a single click — now actually start the selection.
-                        _terminal.Selection.StartSelection(_pendingSelectionStart.Value.Col, _pendingSelectionStart.Value.Row, XT.Selection.SelectionMode.Normal);
+                        // Anchor from the absolute line captured at press, re-projected to the
+                        // current ViewportY in case the buffer scrolled before the first move.
+                        var a = _selAnchorAbs ?? (col, vy + viewportRow);
+                        _terminal.Selection.StartSelection(a.Item1, a.Item2 - vy, XT.Selection.SelectionMode.Normal);
                         _pendingSelectionStart = null;
                     }
+                    _selFocusAbs = (col, vy + viewportRow);
                     _terminal.Selection.UpdateSelection(col, viewportRow);
                     this.RequestInvalidate();
                     e.Handled = true;
@@ -1989,6 +2054,9 @@ namespace Iciclecreek.Terminal
                     if (!_isAlternateBuffer)
                     {
                         _terminal.Buffer.ScrollToBottom();
+                        // ScrollToBottom moves ViewportY directly (bypassing the setter), so
+                        // re-project here too to keep a held selection on its content.
+                        ReprojectSelection();
                         var newY = _terminal.Buffer.ViewportY;
                         var newMax = MaxScrollback;
 
