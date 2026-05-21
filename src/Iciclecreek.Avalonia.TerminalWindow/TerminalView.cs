@@ -594,6 +594,11 @@ namespace Iciclecreek.Terminal
             var text = await clipboard.TryGetTextAsync();
             if (!string.IsNullOrEmpty(text))
             {
+                // Normalize Windows line endings to Unix. Bare CR characters
+                // render as a separate blank line in nano/vi over SSH because
+                // the terminal interprets them as carriage returns.
+                text = text.Replace("\r\n", "\n").Replace("\r", "\n");
+
                 // Wrap paste in bracketed paste sequences if mode is enabled
                 if (_terminal.BracketedPasteMode)
                 {
@@ -617,7 +622,22 @@ namespace Iciclecreek.Terminal
             if (clipboard == null)
                 return false;
 
-            var text = _terminal.Selection.GetSelectionText();
+            // XTerm.NET 1.0.12's BufferLine.TranslateToString throws
+            // IndexOutOfRangeException when the selection's end column is past
+            // the line's actual buffer length — easy to hit by dragging into
+            // trailing whitespace past the prompt. Catch it so we degrade to
+            // "copy did nothing" instead of bubbling up to the UI thread.
+            string text;
+            try
+            {
+                text = _terminal.Selection.GetSelectionText();
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[TerminalView] GetSelectionText failed: {ex.GetType().Name}: {ex.Message}");
+                return false;
+            }
+
             if (!string.IsNullOrEmpty(text))
             {
                 // Normalize line endings for the current platform
@@ -860,6 +880,31 @@ namespace Iciclecreek.Terminal
         }
 
         /// <summary>
+        /// Public hook for host applications to clear the current selection
+        /// (e.g. after a right-click copy gesture handled in the host).
+        /// Also requests a redraw.
+        /// </summary>
+        public void ClearSelection()
+        {
+            ClearSelectionState();
+            this.RequestInvalidate();
+        }
+
+        /// <summary>
+        /// Returns true when <paramref name="key"/> is a bare modifier key
+        /// (Ctrl/Shift/Alt/Win L or R). Used to keep the selection alive while
+        /// the user is composing a chord.
+        /// </summary>
+        private static bool IsModifierKey(Key key) => key switch
+        {
+            Key.LeftCtrl or Key.RightCtrl
+                or Key.LeftShift or Key.RightShift
+                or Key.LeftAlt or Key.RightAlt
+                or Key.LWin or Key.RWin => true,
+            _ => false,
+        };
+
+        /// <summary>
         /// Re-issues the selection to the (viewport-relative) SelectionManager using the current
         /// ViewportY, so the highlight and copied text track the buffer content across scrollback.
         /// Call after any change to ViewportY/YDisp.
@@ -1048,8 +1093,12 @@ namespace Iciclecreek.Terminal
                     }
                 }
 
-                // Clear selection for any other keystroke
-                if (_terminal.Selection.HasSelection)
+                // Clear selection for any other keystroke — but NOT for bare
+                // modifier-key presses (Ctrl/Shift/Alt/Win held alone). Without
+                // this guard, simply pressing Ctrl to prepare a chord
+                // (Ctrl+RightClick in the host app, Ctrl+Shift+C, etc.) would
+                // wipe the user's selection before they completed the gesture.
+                if (_terminal.Selection.HasSelection && !IsModifierKey(e.Key))
                 {
                     ClearSelectionState();
                     this.RequestInvalidate();
