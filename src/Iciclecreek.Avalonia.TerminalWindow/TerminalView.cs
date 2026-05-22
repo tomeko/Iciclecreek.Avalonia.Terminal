@@ -622,6 +622,29 @@ namespace Iciclecreek.Terminal
             if (clipboard == null)
                 return false;
 
+            // Re-issue the selection in current viewport coordinates before reading.
+            // GetSelectionText resolves rows via the SelectionManager's stored y values,
+            // which are viewport-relative. If the viewport scrolled (or `clear` shifted
+            // it) since the selection was made, those stored y values are stale and
+            // GetSelectionText reads from the wrong rows. Re-projecting from our held
+            // absolute anchors makes them consistent again.
+            ReprojectSelection();
+
+            // Drop the selection if the held absolute anchors fell off the end of the
+            // scrollback ring (heavy output can evict lines). Without this guard the
+            // next read may target a row that no longer exists or now holds unrelated content.
+            int bufLen = _terminal.Buffer.Length;
+            if (_selAnchorAbs is { AbsLine: var a } && (a < 0 || a >= bufLen))
+            {
+                ClearSelectionState();
+                return false;
+            }
+            if (_selFocusAbs is { AbsLine: var f } && (f < 0 || f >= bufLen))
+            {
+                ClearSelectionState();
+                return false;
+            }
+
             // XTerm.NET 1.0.12's BufferLine.TranslateToString throws
             // IndexOutOfRangeException when the selection's end column is past
             // the line's actual buffer length — easy to hit by dragging into
@@ -635,6 +658,7 @@ namespace Iciclecreek.Terminal
             catch (Exception ex)
             {
                 Debug.WriteLine($"[TerminalView] GetSelectionText failed: {ex.GetType().Name}: {ex.Message}");
+                ClearSelectionState();
                 return false;
             }
 
@@ -1585,6 +1609,11 @@ namespace Iciclecreek.Terminal
                 {
                     RaisePropertyChanged(IsAlternateBufferProperty, oldValue, _isAlternateBuffer);
                 }
+
+                // Switching buffer types (e.g. entering/leaving vim) invalidates
+                // any absolute line indices we were holding from the prior buffer.
+                // Wipe selection state so a later copy can't read from the wrong buffer.
+                ClearSelectionState();
 
                 RaisePropertyChanged(MaxScrollbackProperty, default(int), MaxScrollback);
                 RaisePropertyChanged(ViewportLinesProperty, default(int), ViewportLines);
