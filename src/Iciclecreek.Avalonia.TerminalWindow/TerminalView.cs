@@ -582,7 +582,13 @@ namespace Iciclecreek.Terminal
         /// <summary>
         /// Pastes text from the clipboard into the terminal.
         /// </summary>
-        public async Task PasteAsync()
+        /// <param name="ensureTrailingNewline">
+        /// When true, guarantees the shell executes the final line by sending a
+        /// carriage return (Enter) after the pasted content. The Enter is sent
+        /// <em>outside</em> any bracketed-paste wrapper — a trailing newline inside
+        /// bracketed paste is treated as literal text and does not run the command.
+        /// </param>
+        public async Task PasteAsync(bool ensureTrailingNewline = false)
         {
             if (_ptyConnection == null)
                 return;
@@ -599,11 +605,23 @@ namespace Iciclecreek.Terminal
                 // the terminal interprets them as carriage returns.
                 text = text.Replace("\r\n", "\n").Replace("\r", "\n");
 
+                // For the "execute" case, drop any trailing newlines from the pasted
+                // body; the executing Enter is appended separately below so it lands
+                // after the (optional) bracketed-paste terminator.
+                if (ensureTrailingNewline)
+                    text = text.TrimEnd('\n');
+
                 // Wrap paste in bracketed paste sequences if mode is enabled
                 if (_terminal.BracketedPasteMode)
                 {
                     text = $"\u001b[200~{text}\u001b[201~";
                 }
+
+                // Append the executing Enter after the bracketed-paste close so the
+                // shell actually runs the command (a newline inside the bracket is
+                // literal and won't execute).
+                if (ensureTrailingNewline)
+                    text += "\r";
 
                 await SendToPtyAsync(text);
             }
@@ -664,6 +682,13 @@ namespace Iciclecreek.Terminal
 
             if (!string.IsNullOrEmpty(text))
             {
+                // Trim trailing whitespace from each line. Full-screen apps (nano/vim)
+                // paint every cell in the alternate buffer, so rows come back padded to
+                // the full terminal width with space cells and are not flagged as
+                // wrapped; without this, copied text carries a block of trailing spaces
+                // on every line.
+                text = TrimTrailingWhitespacePerLine(text);
+
                 // Normalize line endings for the current platform
                 if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 {
@@ -676,6 +701,19 @@ namespace Iciclecreek.Terminal
             }
 
             return false;
+        }
+
+        /// <summary>
+        /// Right-trims spaces and tabs from every line of <paramref name="text"/>,
+        /// preserving the line breaks themselves (any trailing <c>\r</c> is left for
+        /// the platform line-ending normalization to handle).
+        /// </summary>
+        private static string TrimTrailingWhitespacePerLine(string text)
+        {
+            var lines = text.Split('\n');
+            for (int i = 0; i < lines.Length; i++)
+                lines[i] = lines[i].TrimEnd(' ', '\t');
+            return string.Join("\n", lines);
         }
 
         /// <summary>
@@ -2070,6 +2108,12 @@ namespace Iciclecreek.Terminal
             try
             {
                 var buffer = new byte[0x40000];
+                // Stateful decoder: a multi-byte UTF-8 sequence can straddle two PTY
+                // reads (common over SSH / under heavy output). A per-chunk
+                // Encoding.GetString would turn the split bytes into U+FFFD garbage;
+                // the decoder retains the incomplete trailing bytes until the next read.
+                var decoder = Utf8NoBom.GetDecoder();
+                var charBuffer = new char[buffer.Length + 1];
                 while (!cancellationToken.IsCancellationRequested && _ptyConnection != null)
                 {
                     var bytesRead = await _ptyConnection.ReaderStream.ReadAsync(buffer, 0, buffer.Length, cancellationToken);
@@ -2091,7 +2135,8 @@ namespace Iciclecreek.Terminal
                         break;
                     }
 
-                    var output = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                    var charCount = decoder.GetChars(buffer, 0, bytesRead, charBuffer, 0);
+                    var output = new string(charBuffer, 0, charCount);
 
                     // Shell-integration injection: on the first chunk of PTY data the
                     // remote shell has printed its initial prompt, so it is ready to
