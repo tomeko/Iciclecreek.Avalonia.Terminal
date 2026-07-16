@@ -1,4 +1,4 @@
-using Avalonia;
+﻿using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Input.Platform;
@@ -14,6 +14,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
@@ -1831,12 +1832,36 @@ namespace Iciclecreek.Terminal
 
         private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
 
-        private async Task SendToPtyAsync(string data, CancellationToken ct = default)
+        // Opt-in input tracing: set env var TERMTHING_INPUT_TRACE=1 to capture every byte
+        // written to the PTY, tagged with the calling method, so we can tell whether garbage
+        // arrives as duplicate OnTextInput/IME sends or reordered key sequences.
+        private static readonly bool _inputTrace =
+            Environment.GetEnvironmentVariable("TERMTHING_INPUT_TRACE") is { Length: > 0 };
+
+        internal static string EscapeForTrace(string s)
+        {
+            var sb = new StringBuilder(s.Length + 8);
+            foreach (var ch in s)
+            {
+                if (ch == 0x1b) sb.Append("\\e");
+                else if (ch == '\r') sb.Append("\\r");
+                else if (ch == '\n') sb.Append("\\n");
+                else if (ch == '\t') sb.Append("\\t");
+                else if (ch < 0x20 || ch == 0x7f) sb.Append($"\\x{(int)ch:X2}");
+                else sb.Append(ch);
+            }
+            return sb.ToString();
+        }
+
+        private async Task SendToPtyAsync(string data, CancellationToken ct = default, [CallerMemberName] string caller = "")
         {
             // Capture the connection reference locally to avoid any potential race conditions
             var ptyConnection = _ptyConnection;
             if (ptyConnection == null || string.IsNullOrEmpty(data))
                 return;
+
+            if (_inputTrace)
+                Trace.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] PTY<= [{caller}] \"{EscapeForTrace(data)}\" (len={data.Length})");
 
             await _semaphore.WaitAsync(ct).ConfigureAwait(false);
             try
@@ -2159,6 +2184,9 @@ namespace Iciclecreek.Terminal
 
                     if (output.Length == 0)
                         continue;
+
+                    if (_inputTrace)
+                        Trace.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] PTY=> \"{EscapeForTrace(output)}\" (len={output.Length})");
 
                     // Snapshot before write so we can detect buffer growth (MaxScrollback
                     // increases when _terminal.Write adds lines; ScrollToBottom only moves
@@ -3196,6 +3224,8 @@ namespace Iciclecreek.Terminal
             /// </summary>
             public override void SetPreeditText(string? preeditText)
             {
+                if (_inputTrace)
+                    Trace.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] IME  SetPreedit(1) \"{EscapeForTrace(preeditText ?? "<null>")}\"");
                 _preeditText = preeditText;
                 _view.RequestInvalidate();
             }
@@ -3213,6 +3243,8 @@ namespace Iciclecreek.Terminal
                 // cursorPos (position of IME cursor within the composition string) is intentionally
                 // not used: the terminal renders preedit as a simple underlined text overlay and
                 // does not support a separate cursor inside the composition window.
+                if (_inputTrace)
+                    Trace.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] IME  SetPreedit(2) \"{EscapeForTrace(preeditText ?? "<null>")}\" cursor={cursorPos}");
                 _preeditText = preeditText;
                 _view.RequestInvalidate();
             }

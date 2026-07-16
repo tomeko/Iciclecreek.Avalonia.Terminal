@@ -39,6 +39,10 @@
     <PackageReference Include="Porta.Pty" Version="1.0.7" />
     <PackageReference Include="Unicode.net" Version="2.0.0" />
     <PackageReference Include="Wcwidth" Version="4.0.1" />
-    <PackageReference Include="XTerm.NET" Version="1.0.12" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Vendored fork of XTerm.NET carrying the ICH (CSI @) smear fix.
+         See the XTerm.NET submodule at the repository root. -->
+    <ProjectReference Include="..\..\..\XTerm.NET\src\XTerm.NET\XTerm.NET.csproj" />
   </ItemGroup>
 </Project>
