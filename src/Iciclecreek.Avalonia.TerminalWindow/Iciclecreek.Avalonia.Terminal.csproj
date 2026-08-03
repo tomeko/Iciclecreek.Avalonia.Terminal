@@ -5,8 +5,8 @@
     <LangVersion>latest</LangVersion>
   </PropertyGroup>
   <PropertyGroup>
-    <Version>2.0.1</Version>
-    <AssemblyVersion>2.0.1.0</AssemblyVersion>
+    <Version>2.0.3</Version>
+    <AssemblyVersion>2.0.3.0</AssemblyVersion>
     <Description>Avalonia terminal controls (TerminalControl/TerminalWindow) that provide an XTerm console for hosting console applications in Avalonia.</Description>
     <Company>Iciclecreek</Company>
     <Authors>Tom Laird-McConnell</Authors>
@@ -42,6 +42,7 @@
   </ItemGroup>
   <ItemGroup>
     <!-- Vendored fork of XTerm.NET carrying the ICH (CSI @) smear fix.
+         Supersedes the upstream PackageReference to XTerm.NET 1.0.14.
          See the XTerm.NET submodule at the repository root. -->
     <ProjectReference Include="..\..\..\XTerm.NET\src\XTerm.NET\XTerm.NET.csproj" />
   </ItemGroup>
