@@ -1,4 +1,4 @@
-﻿using Avalonia;
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Input.Platform;
@@ -42,12 +42,28 @@ namespace Iciclecreek.Terminal
         private string? _shellIntegrationCommand;
         private volatile bool _shellIntegrationSent;
 
+        // Echo suppression state. The remote tty echoes the injected command back at
+        // us, and that echo has to be removed before it reaches the screen. Matching
+        // per-chunk is not enough: a line editor (zsh's ZLE especially) redraws the
+        // line it is echoing in several writes, so the sentinel can straddle two
+        // reads and slip through. Instead, once injected we hold back the trailing
+        // partial line and only release it after a newline arrives, which makes the
+        // match see whole logical lines regardless of how they were chunked.
+        private readonly object _shellIntegrationHoldLock = new();
+        private readonly StringBuilder _shellIntegrationHold = new();
+        private bool _shellIntegrationFiltering;
+        // Bounds on the hold, so output can never be swallowed permanently if the
+        // echo does not come back in the shape we expect.
+        private const int ShellIntegrationHoldMaxChars = 8192;
+        private static readonly TimeSpan ShellIntegrationHoldTimeout = TimeSpan.FromSeconds(2);
+
         /// <summary>
         /// Gets or sets a shell command that is injected into the PTY on the first
         /// incoming data event (i.e. when the remote shell has started). The command
-        /// should embed <c>__ICTERMINT__</c> as a comment token; any line in the PTY
-        /// output containing that token is automatically suppressed so the injection
-        /// is invisible to the user.
+        /// must embed <c>__ICTERMINT__</c> somewhere (a variable assignment travels
+        /// further than a <c>#</c> comment — zsh does not enable interactive comments
+        /// by default); any output line containing that token is suppressed so the
+        /// injection stays invisible to the user.
         /// Leave <c>null</c> (default) to disable the feature.
         /// </summary>
         public string? ShellIntegrationCommand
@@ -581,6 +597,15 @@ namespace Iciclecreek.Terminal
         public void Kill() => _ptyConnection?.Kill();
 
         /// <summary>
+        /// Controls how clipboard text is normalized before it reaches the PTY.
+        /// Defaults to <see cref="PasteSanitizationMode.AsciiPunctuation"/> — the
+        /// terminal is a place where text is executed, not typeset, so the
+        /// typographic substitutions a desktop clipboard picks up are corrected
+        /// rather than sent through to confuse the shell.
+        /// </summary>
+        public PasteSanitizationMode PasteSanitization { get; set; } = PasteSanitizationMode.AsciiPunctuation;
+
+        /// <summary>
         /// Pastes text from the clipboard into the terminal.
         /// </summary>
         /// <param name="ensureTrailingNewline">
@@ -601,10 +626,12 @@ namespace Iciclecreek.Terminal
             var text = await clipboard.TryGetTextAsync();
             if (!string.IsNullOrEmpty(text))
             {
-                // Normalize Windows line endings to Unix. Bare CR characters
-                // render as a separate blank line in nano/vi over SSH because
-                // the terminal interprets them as carriage returns.
-                text = text.Replace("\r\n", "\n").Replace("\r", "\n");
+                // Normalize line endings, strip invisible/control characters and fold
+                // typographic punctuation back to ASCII. See PasteSanitizer for why
+                // each class of character is a problem on the receiving end.
+                text = PasteSanitizer.Sanitize(text, PasteSanitization);
+                if (text.Length == 0)
+                    return;
 
                 // For the "execute" case, drop any trailing newlines from the pasted
                 // body; the executing Enter is appended separately below so it lands
@@ -931,8 +958,17 @@ namespace Iciclecreek.Terminal
         }
 
         /// <summary>
-        /// Clears the selection in the underlying manager and our absolute-coord tracking.
-        /// All in-fork selection clears route through here so a stale anchor can't be re-projected.
+        /// Clears the selection in the underlying manager and this fork's absolute-coord
+        /// tracking together.
+        /// <para>
+        /// Convenience, not a required funnel: calling <c>Selection.ClearSelection()</c>
+        /// directly is also correct, which is what upstream code does and why it needs no
+        /// adapting here. The anchors below are only ever read while
+        /// <c>Selection.HasSelection</c> is true, and every <c>StartSelection</c> assigns
+        /// them in the same step, so anchors left behind by a bare clear are inert — the
+        /// next read either short-circuits on <c>HasSelection</c> or overwrites them.
+        /// Preserve that pairing when adding a <c>StartSelection</c> call and this stays true.
+        /// </para>
         /// </summary>
         private void ClearSelectionState()
         {
@@ -952,20 +988,6 @@ namespace Iciclecreek.Terminal
             ClearSelectionState();
             this.RequestInvalidate();
         }
-
-        /// <summary>
-        /// Returns true when <paramref name="key"/> is a bare modifier key
-        /// (Ctrl/Shift/Alt/Win L or R). Used to keep the selection alive while
-        /// the user is composing a chord.
-        /// </summary>
-        private static bool IsModifierKey(Key key) => key switch
-        {
-            Key.LeftCtrl or Key.RightCtrl
-                or Key.LeftShift or Key.RightShift
-                or Key.LeftAlt or Key.RightAlt
-                or Key.LWin or Key.RWin => true,
-            _ => false,
-        };
 
         /// <summary>
         /// Re-issues the selection to the (viewport-relative) SelectionManager using the current
@@ -1092,8 +1114,17 @@ namespace Iciclecreek.Terminal
         // Ctrl+Shift+C / Ctrl+Shift+V instead, because plain Ctrl+C is reserved for SIGINT.
         private static readonly bool IsMacOS = RuntimeInformation.IsOSPlatform(OSPlatform.OSX);
 
-        // NOTE: IsModifierKey lives with the selection helpers above — upstream added an
-        // identical copy here in the macOS clipboard change; the two were deduped on merge.
+        // True when the key is a modifier pressed on its own (no associated character),
+        // e.g. the ⌘/Ctrl/Shift/Alt keys. Used so a bare modifier press doesn't clear
+        // an active selection before the rest of a copy shortcut is typed.
+        private static bool IsModifierKey(Key key) => key switch
+        {
+            Key.LeftShift or Key.RightShift or
+            Key.LeftCtrl or Key.RightCtrl or
+            Key.LeftAlt or Key.RightAlt or
+            Key.LWin or Key.RWin => true,
+            _ => false,
+        };
 
         protected override async void OnKeyDown(KeyEventArgs e)
         {
@@ -1126,7 +1157,7 @@ namespace Iciclecreek.Terminal
                 {
                     e.Handled = true;
                     await CopyAsync();
-                    ClearSelectionState();
+                    _terminal.Selection.ClearSelection();
                     this.RequestInvalidate();
                 }
                 else
@@ -1173,7 +1204,7 @@ namespace Iciclecreek.Terminal
                     {
                         e.Handled = true;
                         await CopyAsync();
-                        ClearSelectionState();
+                        _terminal.Selection.ClearSelection();
                         this.RequestInvalidate();
                         return;
                     }
@@ -1187,20 +1218,19 @@ namespace Iciclecreek.Terminal
                     {
                         e.Handled = true;
                         await CopyAsync();
-                        ClearSelectionState();
+                        _terminal.Selection.ClearSelection();
                         this.RequestInvalidate();
                         return;
                     }
                 }
 
-                // Clear selection for any other keystroke — but NOT for bare
-                // modifier-key presses (Ctrl/Shift/Alt/Win/Cmd held alone). Without
-                // this guard, simply pressing Ctrl to prepare a chord
-                // (Ctrl+RightClick in the host app, Ctrl+Shift+C, Cmd+C, etc.) would
-                // wipe the user's selection before they completed the gesture.
+                // Clear selection for any other keystroke - but ignore bare modifier
+                // presses. Pressing ⌘/Ctrl/Shift on its own fires a KeyDown before the
+                // shortcut's letter arrives; clearing here would lose the selection
+                // before Cmd+C / Ctrl+Shift+C could copy it.
                 if (_terminal.Selection.HasSelection && !IsModifierKey(e.Key))
                 {
-                    ClearSelectionState();
+                    _terminal.Selection.ClearSelection();
                     this.RequestInvalidate();
                 }
 
@@ -1354,7 +1384,7 @@ namespace Iciclecreek.Terminal
             // Clear selection when text is being input
             if (_terminal.Selection.HasSelection)
             {
-                ClearSelectionState();
+                _terminal.Selection.ClearSelection();
                 this.RequestInvalidate();
             }
 
@@ -1394,7 +1424,7 @@ namespace Iciclecreek.Terminal
                         if (_terminal.Selection.HasSelection)
                         {
                             await CopyAsync();
-                            ClearSelectionState();
+                            _terminal.Selection.ClearSelection();
                             this.RequestInvalidate();
                         }
                         else
@@ -1408,7 +1438,7 @@ namespace Iciclecreek.Terminal
                     // Left-click clears existing selection before starting new one
                     if (props.IsLeftButtonPressed && _terminal.Selection.HasSelection)
                     {
-                        ClearSelectionState();
+                        _terminal.Selection.ClearSelection();
                         this.RequestInvalidate();
                     }
 
@@ -2212,17 +2242,22 @@ namespace Iciclecreek.Terminal
                     if (!_shellIntegrationSent && _shellIntegrationCommand is { Length: > 0 } cmd)
                     {
                         _shellIntegrationSent = true;
+                        BeginShellIntegrationHold();
                         try
                         {
                             var cmdBytes = Utf8NoBom.GetBytes(cmd + "\n");
                             await _ptyConnection!.WriterStream.WriteAsync(cmdBytes, 0, cmdBytes.Length, cancellationToken)
                                 .ConfigureAwait(false);
                         }
-                        catch { /* best-effort */ }
+                        catch
+                        {
+                            // Injection failed, so no echo is coming — release immediately
+                            // rather than making the user wait out the hold timeout.
+                            EndShellIntegrationHold();
+                        }
                     }
 
-                    if (output.Contains(ShellIntegrationSentinel, StringComparison.Ordinal))
-                        output = StripSentinelLines(output);
+                    output = FilterShellIntegrationEcho(output);
 
                     if (output.Length == 0)
                         continue;
@@ -2288,6 +2323,118 @@ namespace Iciclecreek.Terminal
                 }
 
                 this.RequestInvalidate();
+            }
+        }
+
+        /// <summary>
+        /// Starts holding back the trailing partial line of PTY output so the echo of the
+        /// injected command can be matched as a whole line. Also arms the timeout that
+        /// releases the hold if the expected echo never arrives.
+        /// </summary>
+        private void BeginShellIntegrationHold()
+        {
+            lock (_shellIntegrationHoldLock)
+            {
+                _shellIntegrationFiltering = true;
+                _shellIntegrationHold.Clear();
+            }
+
+            // The read loop only re-evaluates the hold when more data shows up, so a
+            // shell that goes quiet right after the injection would otherwise leave the
+            // held prompt invisible. This timer is the backstop for that case.
+            _ = Task.Delay(ShellIntegrationHoldTimeout).ContinueWith(_ =>
+            {
+                var pending = EndShellIntegrationHold();
+                if (pending.Length == 0)
+                    return;
+
+                lock (_terminalLock)
+                {
+                    _terminal.Write(pending);
+                    if (!_isAlternateBuffer)
+                        _terminal.Buffer.ScrollToBottom();
+                }
+                this.RequestInvalidate();
+            }, TaskScheduler.Default);
+        }
+
+        /// <summary>
+        /// Stops holding output and returns whatever was still buffered (empty when the
+        /// hold was already released). Safe to call more than once.
+        /// </summary>
+        private string EndShellIntegrationHold()
+        {
+            lock (_shellIntegrationHoldLock)
+            {
+                if (!_shellIntegrationFiltering)
+                    return string.Empty;
+                _shellIntegrationFiltering = false;
+                var pending = _shellIntegrationHold.ToString();
+                _shellIntegrationHold.Clear();
+                return pending;
+            }
+        }
+
+        /// <summary>
+        /// While the hold is active, buffers <paramref name="output"/> and releases only
+        /// the part up to the last newline, so sentinel matching always sees complete
+        /// logical lines even when the shell echoes one line across several reads.
+        /// Returns the text that should be written to the terminal now.
+        /// </summary>
+        /// <remarks>
+        /// Only the trailing partial line is ever withheld, so bulk output (a login
+        /// banner, say) still appears immediately. The hold ends as soon as a sentinel
+        /// line has been dropped, or when it exceeds its size or time budget — after
+        /// which everything buffered is released rather than discarded.
+        /// </remarks>
+        private string FilterShellIntegrationEcho(string output)
+        {
+            lock (_shellIntegrationHoldLock)
+            {
+                if (!_shellIntegrationFiltering)
+                {
+                    // Late echoes (a shell that re-prints its line after the hold expired)
+                    // still get the cheap per-chunk treatment.
+                    return output.Contains(ShellIntegrationSentinel, StringComparison.Ordinal)
+                        ? StripSentinelLines(output)
+                        : output;
+                }
+
+                _shellIntegrationHold.Append(output);
+                var pending = _shellIntegrationHold.ToString();
+                _shellIntegrationHold.Clear();
+
+                bool overBudget = pending.Length > ShellIntegrationHoldMaxChars;
+                int lastNewline = pending.LastIndexOf('\n');
+
+                if (lastNewline < 0)
+                {
+                    // No complete line yet. Keep waiting unless we have held too much.
+                    if (!overBudget)
+                    {
+                        _shellIntegrationHold.Append(pending);
+                        return string.Empty;
+                    }
+                    _shellIntegrationFiltering = false;
+                    return pending;
+                }
+
+                var complete = pending.Substring(0, lastNewline + 1);
+                var tail = pending.Substring(lastNewline + 1);
+
+                bool sawSentinel = complete.Contains(ShellIntegrationSentinel, StringComparison.Ordinal);
+                if (sawSentinel)
+                    complete = StripSentinelLines(complete);
+
+                if (sawSentinel || overBudget)
+                {
+                    // The echo has been dealt with; stop interfering with the stream.
+                    _shellIntegrationFiltering = false;
+                    return complete + tail;
+                }
+
+                _shellIntegrationHold.Append(tail);
+                return complete;
             }
         }
 

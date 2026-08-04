@@ -64,6 +64,11 @@ namespace Iciclecreek.Terminal
                 nameof(ShellIntegrationCommand),
                 defaultValue: null);
 
+        public static readonly StyledProperty<PasteSanitizationMode> PasteSanitizationProperty =
+            AvaloniaProperty.Register<TerminalControl, PasteSanitizationMode>(
+                nameof(PasteSanitization),
+                defaultValue: PasteSanitizationMode.AsciiPunctuation);
+
         public event EventHandler<ProcessExitedEventArgs>? ProcessExited;
 
         /// <summary>
@@ -135,6 +140,17 @@ namespace Iciclecreek.Terminal
         {
             get => GetValue(ShellIntegrationCommandProperty);
             set => SetValue(ShellIntegrationCommandProperty, value);
+        }
+
+        /// <summary>
+        /// Gets or sets how clipboard text is normalized on paste. See
+        /// <see cref="PasteSanitizationMode"/>; defaults to
+        /// <see cref="PasteSanitizationMode.AsciiPunctuation"/>.
+        /// </summary>
+        public PasteSanitizationMode PasteSanitization
+        {
+            get => GetValue(PasteSanitizationProperty);
+            set => SetValue(PasteSanitizationProperty, value);
         }
 
         private static bool _stylesLoaded = false;
@@ -313,6 +329,7 @@ namespace Iciclecreek.Terminal
                 _scrollBar.Scroll += OnScrollBarScroll;
                 _terminalView.Options = Options ?? new XTerm.Options.TerminalOptions();
                 _terminalView.ShellIntegrationCommand = ShellIntegrationCommand;
+                _terminalView.PasteSanitization = PasteSanitization;
                 _terminalView.PropertyChanged += OnTerminalViewPropertyChanged;
                 _terminalView.ProcessExited += OnTerminalViewProcessExited;
                 SetCurrentDirectory(_terminalView.CurrentDirectory);
@@ -353,6 +370,8 @@ namespace Iciclecreek.Terminal
             base.OnPropertyChanged(change);
             if (change.Property == ShellIntegrationCommandProperty && _terminalView != null)
                 _terminalView.ShellIntegrationCommand = change.NewValue as string;
+            else if (change.Property == PasteSanitizationProperty && _terminalView != null)
+                _terminalView.PasteSanitization = (PasteSanitizationMode)change.NewValue!;
         }
 
         private void SetCurrentDirectory(string? currentDirectory)
