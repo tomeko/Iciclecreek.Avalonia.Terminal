@@ -36,11 +36,21 @@ namespace Iciclecreek.Terminal
         private int _bufferSize = 1000;
         private bool _isAlternateBuffer;
 
-        // Shell-integration injection: when set, sent to PTY on first data receipt
-        // and the echoed line (identified by a sentinel token) is stripped from output.
+        // Shell-integration injection: when set, sent to the PTY once the shell looks
+        // ready, and the echoed line (identified by a sentinel token) is stripped out.
+        //
+        // "Ready" means the PTY output has gone quiet, not that the first byte arrived.
+        // Over SSH the first chunk is the banner, which the remote shell may print long
+        // before its line editor is up; bytes written that early sit unread in the tty
+        // input buffer and only surface when the user presses a key, at which point the
+        // echo appears with nothing armed to suppress it. Waiting for a lull means the
+        // prompt has been drawn and the shell is actually reading.
         private const string ShellIntegrationSentinel = "__ICTERMINT__";
         private string? _shellIntegrationCommand;
         private volatile bool _shellIntegrationSent;
+        private volatile bool _shellIntegrationScheduled;
+        private long _lastOutputTicks;
+        private static readonly TimeSpan ShellIntegrationQuietPeriod = TimeSpan.FromMilliseconds(750);
 
         // Echo suppression state. The remote tty echoes the injected command back at
         // us, and that echo has to be removed before it reaches the screen. Matching
@@ -73,6 +83,7 @@ namespace Iciclecreek.Terminal
             {
                 _shellIntegrationCommand = value;
                 _shellIntegrationSent = false;
+                _shellIntegrationScheduled = false;
             }
         }
 
@@ -2239,22 +2250,14 @@ namespace Iciclecreek.Terminal
                     // remote shell has printed its initial prompt, so it is ready to
                     // receive input. Send the integration command once, then strip any
                     // output line that echoes the sentinel token.
-                    if (!_shellIntegrationSent && _shellIntegrationCommand is { Length: > 0 } cmd)
+                    // Every chunk pushes back the quiet-period deadline; the injection
+                    // fires from the watcher below once output actually stops.
+                    Volatile.Write(ref _lastOutputTicks, DateTime.UtcNow.Ticks);
+                    if (!_shellIntegrationSent && !_shellIntegrationScheduled
+                        && _shellIntegrationCommand is { Length: > 0 })
                     {
-                        _shellIntegrationSent = true;
-                        BeginShellIntegrationHold();
-                        try
-                        {
-                            var cmdBytes = Utf8NoBom.GetBytes(cmd + "\n");
-                            await _ptyConnection!.WriterStream.WriteAsync(cmdBytes, 0, cmdBytes.Length, cancellationToken)
-                                .ConfigureAwait(false);
-                        }
-                        catch
-                        {
-                            // Injection failed, so no echo is coming — release immediately
-                            // rather than making the user wait out the hold timeout.
-                            EndShellIntegrationHold();
-                        }
+                        _shellIntegrationScheduled = true;
+                        ScheduleShellIntegrationInjection(cancellationToken);
                     }
 
                     output = FilterShellIntegrationEcho(output);
@@ -2324,6 +2327,60 @@ namespace Iciclecreek.Terminal
 
                 this.RequestInvalidate();
             }
+        }
+
+        /// <summary>
+        /// Waits for PTY output to go quiet, then injects the shell-integration command.
+        /// </summary>
+        /// <remarks>
+        /// The quiet period is the readiness signal. Writing on the first byte races the
+        /// remote shell's startup: over SSH those bytes land in the tty input buffer
+        /// before the line editor is reading, so the command is neither executed nor
+        /// echoed until the user next presses a key — and by then the echo-suppression
+        /// window is long gone, so the injection appears on screen. Once output pauses,
+        /// the prompt is drawn and the shell is waiting on input.
+        /// </remarks>
+        private void ScheduleShellIntegrationInjection(CancellationToken ct)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    // Sleep until the stream has been idle for the full quiet period,
+                    // extending each time more output lands (a slow motd, say).
+                    while (true)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        var idle = DateTime.UtcNow - new DateTime(Volatile.Read(ref _lastOutputTicks), DateTimeKind.Utc);
+                        if (idle >= ShellIntegrationQuietPeriod)
+                            break;
+                        await Task.Delay(ShellIntegrationQuietPeriod - idle, ct).ConfigureAwait(false);
+                    }
+
+                    if (_shellIntegrationSent)
+                        return;
+                    var cmd = _shellIntegrationCommand;
+                    if (string.IsNullOrEmpty(cmd))
+                        return;
+
+                    _shellIntegrationSent = true;
+                    BeginShellIntegrationHold();
+
+                    var cmdBytes = Utf8NoBom.GetBytes(cmd + "\n");
+                    await _ptyConnection!.WriterStream.WriteAsync(cmdBytes, 0, cmdBytes.Length, ct)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    EndShellIntegrationHold();
+                }
+                catch
+                {
+                    // Injection failed, so no echo is coming — release immediately rather
+                    // than making the user wait out the hold timeout.
+                    EndShellIntegrationHold();
+                }
+            }, ct);
         }
 
         /// <summary>
